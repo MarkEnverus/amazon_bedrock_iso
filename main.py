@@ -5,6 +5,10 @@ from pydantic import BaseModel, field_validator
 import boto3
 from botocore.exceptions import ClientError
 import os
+import lancedb
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import os
 
 os.environ["AWS_PROFILE"] = "genai-power-user"
 os.environ["ANTHROPIC_MODEL"] = "q-developer-user"
@@ -237,8 +241,109 @@ def summarize_correlation_bedrock(combined_data):
     return response_text
 
 
-# Press the green button in the gutter to run the script.
+def test_lancedb_with_real_data():
+    """Test LanceDB with your actual power and weather data"""
+
+    # Get your existing data
+    items = get_intraday_data()
+    if not items:
+        print("No intraday data retrieved")
+        return
+
+    avg_prices = aggregate_intraday_by_date(items)
+    weather_data = get_daily_temperature_socal()
+    if not weather_data:
+        print("No weather data retrieved")
+        return
+
+    combined_data = combine_price_weather(avg_prices, weather_data)
+
+    # Test LanceDB storage
+    print("🚀 Testing LanceDB with real data...")
+
+    db = lancedb.connect("./power_weather_test_db")
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    records = []
+    for entry in combined_data:
+        text_description = f"Date: {entry['date']}, Average Power Price: ${entry['avg_price']:.2f}, Max Temperature: {entry['temp_max']}°C, Min Temperature: {entry['temp_min']}°C"
+        embedding = model.encode(text_description).tolist()
+
+        records.append({
+            **entry,
+            "text_description": text_description,
+            "vector": embedding
+        })
+
+    table = db.create_table("real_power_weather", records, mode="overwrite")
+    print(f"✅ Stored {len(records)} real records in LanceDB")
+
+    # Test queries
+    test_queries = [
+        "hottest days with high power prices",
+        "correlation between temperature and pricing",
+        "August 15th weather and prices"
+    ]
+
+    for query in test_queries:
+        query_embedding = model.encode(query).tolist()
+        results = table.search(query_embedding).limit(3).to_pandas()
+        print(f"\n🔍 Query: '{query}'")
+        for _, row in results.iterrows():
+            print(f"  📅 {row['date']}: ${row['avg_price']:.2f}, {row['temp_max']}°C max")
+
+
+def ask_rag_question(question):
+    """RAG query using your existing LanceDB data"""
+    db = lancedb.connect("./power_weather_test_db")
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    try:
+        table = db.open_table("real_power_weather")
+    except:
+        print("❌ Run test_lancedb_with_real_data() first to create the database")
+        return None
+
+    # Search your stored embeddings
+    query_embedding = model.encode(question).tolist()
+    results = table.search(query_embedding).limit(5).to_pandas()
+
+    print(f"🔍 Found {len(results)} relevant records")
+
+    # Build context from your stored text_descriptions
+    context = "Historical power price and weather data:\n\n"
+    for _, row in results.iterrows():
+        context += f"• {row['text_description']}\n"
+
+    # Enhanced prompt for Bedrock
+    prompt = f"""{context}
+
+Question: {question}
+
+Analyze the historical data above and provide insights about Southern California power prices and weather patterns."""
+
+    # Call Bedrock
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    model_id = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+    native_request = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 800,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    }
+
+    try:
+        response = client.invoke_model(modelId=model_id, body=json.dumps(native_request))
+        model_response = json.loads(response["body"].read())
+        return model_response["content"][0]["text"]
+    except Exception as e:
+        return f"Error calling Bedrock: {e}"
+
+
+# Add this to your main function
 if __name__ == '__main__':
+    # Your existing code...
     items = get_intraday_data()
     if not items:
         print("No intraday data retrieved")
@@ -250,3 +355,22 @@ if __name__ == '__main__':
         else:
             combined_data = combine_price_weather(avg_prices, weather_data)
             summarize_correlation_bedrock(combined_data)
+
+    print("🚀 Testing LanceDB with your real data...")
+    # Test LanceDB
+    test_lancedb_with_real_data()
+    # Now test RAG queries
+    print("\n" + "=" * 50)
+    print("🤖 Testing RAG Questions")
+    print("=" * 50)
+
+    questions = [
+        "What were the power prices like on the hottest days?",
+        "How do temperatures affect power pricing?",
+        "Which day had the highest power price?"
+    ]
+
+    for q in questions:
+        print(f"\n❓ {q}")
+        answer = ask_rag_question(q)
+        print(f"🤖 {answer}")
